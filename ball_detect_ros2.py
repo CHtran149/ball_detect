@@ -95,6 +95,9 @@ class BallFollower(Node):
         self.pid_ang = PID(KP_ANG, KI_ANG, KD_ANG, mn=-MAX_ANGULAR, mx=MAX_ANGULAR)
         self.pid_lin = PID(KP_LIN, KI_LIN, KD_LIN, mn=-MAX_LINEAR, mx=MAX_LINEAR)
 
+        # For FPS calculation
+        self.prev_time_frame = None
+
         # Timer callback
         self.timer = self.create_timer(0.05, self.timer_cb)
         self.get_logger().info("Ball follower node started.")
@@ -111,6 +114,7 @@ class BallFollower(Node):
 
     def timer_cb(self):
         import cv2
+        t_start = time.time()
         ret, frame = self.cap.read()
         if not ret:
             self.get_logger().warn_once("Frame read failed from webcam.")
@@ -136,13 +140,18 @@ class BallFollower(Node):
                    for hh in self.targets_handled)
         ]
 
+        angle_rad = 0.0
+        v_cmd = 0.0
+        w_cmd = 0.0
+
         # FSM
         if self.state == STATE_IDLE:
             if balls_to_consider:
                 self.current_target_bbox = balls_to_consider[0]
                 with self.lock:
                     self.home_pose = self.current_odom
-                self.pid_ang.reset(); self.pid_lin.reset()
+                self.pid_ang.reset()
+                self.pid_lin.reset()
                 self.state = STATE_APPROACH
                 self.get_logger().info(f"State -> APPROACH")
             else:
@@ -159,7 +168,7 @@ class BallFollower(Node):
                 dy = img_cy - t['cy']
                 angle_rad = math.atan2(dx, dy)
                 dist_error = (APPROACH_BBOX_HEIGHT_THRESHOLD - t['bbox_h']) / max(1.0, t['bbox_h'])
-                w_cmd = - self.pid_ang(angle_rad)
+                w_cmd = -self.pid_ang(angle_rad)
                 v_cmd = self.pid_lin(dist_error)
                 v_cmd = max(-MAX_LINEAR, min(MAX_LINEAR, v_cmd))
                 w_cmd = max(-MAX_ANGULAR, min(MAX_ANGULAR, w_cmd))
@@ -189,9 +198,11 @@ class BallFollower(Node):
             angle_to_home = math.atan2(dy, dx)
             yaw_err = angle_normalize(angle_to_home - od[2])
 
+            angle_rad = yaw_err  # log góc lệch ở trạng thái RETURN
             if abs(yaw_err) > 0.15:
                 w_cmd = max(-MAX_ANGULAR, min(MAX_ANGULAR, 1.2 * yaw_err))
-                self.publish_twist(0.0, w_cmd)
+                v_cmd = 0.0
+                self.publish_twist(v_cmd, w_cmd)
             elif dist > RETURN_TOL:
                 v_cmd = max(-MAX_LINEAR, min(MAX_LINEAR, 0.6 * dist))
                 w_cmd = max(-MAX_ANGULAR, min(MAX_ANGULAR, 0.8 * yaw_err))
@@ -201,6 +212,17 @@ class BallFollower(Node):
                 self.current_target_bbox = None
                 self.state = STATE_IDLE
 
+        # Tính FPS
+        t_end = time.time()
+        dt_frame = t_end - (self.prev_time_frame if self.prev_time_frame is not None else t_end)
+        self.prev_time_frame = t_end
+        fps = 1.0 / dt_frame if dt_frame > 0 else float('inf')
+
+        # In log
+        self.get_logger().info(
+            f"Angle error (rad): {angle_rad:.3f} | Linear vel (m/s): {v_cmd:.3f} | Angular vel (rad/s): {w_cmd:.3f} | FPS: {fps:.2f}"
+        )
+
     def publish_twist(self, v, w):
         t = Twist()
         t.linear.x = float(v)
@@ -208,7 +230,7 @@ class BallFollower(Node):
         self.cmd_pub.publish(t)
 
 def angle_normalize(x):
-    return (x + math.pi) % (2*math.pi) - math.pi
+    return (x + math.pi) % (2 * math.pi) - math.pi
 
 def main(args=None):
     rclpy.init(args=args)
