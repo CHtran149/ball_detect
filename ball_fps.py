@@ -4,12 +4,31 @@ import math
 import sys
 import numpy as np
 
-# Thêm đường dẫn repo yolov5 để import
+# Thêm repo yolov5 vào path để import
 sys.path.insert(0, '/home/jetson/yolov5')
 
 from models.common import DetectMultiBackend
-from utils.general import non_max_suppression, scale_coords
+from utils.general import non_max_suppression
 from utils.plots import Annotator, colors
+
+# Hàm scale_coords tự định nghĩa (do repo hiện tại không có sẵn)
+def scale_coords(img1_shape, coords, img0_shape, ratio_pad=None):
+    # Rescale coords (xyxy) from img1_shape to img0_shape
+    if ratio_pad is None:
+        gain = min(img1_shape[0] / img0_shape[0], img1_shape[1] / img0_shape[1])  # gain  = old / new
+        pad = ((img1_shape[1] - img0_shape[1] * gain) / 2, (img1_shape[0] - img0_shape[0] * gain) / 2)  # wh padding
+    else:
+        gain = ratio_pad[0]
+        pad = ratio_pad[1]
+
+    coords[:, [0, 2]] -= pad[0]  # x padding
+    coords[:, [1, 3]] -= pad[1]  # y padding
+    coords[:, :4] /= gain
+    coords[:, 0].clamp_(0, img0_shape[1])  # x1
+    coords[:, 1].clamp_(0, img0_shape[0])  # y1
+    coords[:, 2].clamp_(0, img0_shape[1])  # x2
+    coords[:, 3].clamp_(0, img0_shape[0])  # y2
+    return coords
 
 # Cấu hình
 MODEL_PATH = "./models/best.pt"
@@ -35,12 +54,12 @@ fps_video = cap.get(cv2.CAP_PROP_FPS) if cap.get(cv2.CAP_PROP_FPS) > 0 else 30
 
 point_A = (width // 2, height)  # điểm A: chính giữa đáy khung hình
 
-print("Nhan q de thoat")
+print("nhan q de thoat")
 
 while True:
     ret, frame = cap.read()
     if not ret:
-        print("Khong the lay frame tu webcam")
+        print("Khong the lau frame tu webcam")
         break
 
     start_time = torch.cuda.Event(enable_timing=True)
@@ -67,21 +86,19 @@ while True:
 
     annotator = Annotator(frame)
 
-    if pred[0] is not None:
+    if pred[0] is not None and len(pred[0]):
         # Scale bbox về kích thước ảnh gốc
-        pred_scaled = scale_coords(img_tensor.shape[2:], pred[0][:, :4], frame.shape).round()
-        confs = pred[0][:, 4]
-        class_ids = pred[0][:, 5].int()
+        pred_scaled = scale_coords(img_tensor.shape[2:], pred[0][:, :4].clone(), frame.shape).round()
 
-        for i, (*xyxy, conf, cls) in enumerate(pred[0]):
-            # Lấy bbox scaled đúng
+        for i, det in enumerate(pred[0]):
+            x1, y1, x2, y2, conf, cls = det
             x1, y1, x2, y2 = pred_scaled[i]
 
             ball_count += 1
             label = f"Ball {ball_count}"
 
             # Vẽ bbox
-            annotator.box_label(xyxy, label, color=colors(int(cls), True))
+            annotator.box_label((int(x1), int(y1), int(x2), int(y2)), label, color=colors(int(cls), True))
 
             # Tâm quả bóng
             center_x = int((x1 + x2) / 2)
@@ -121,4 +138,4 @@ while True:
 
 cap.release()
 cv2.destroyAllWindows()
-print("Da thoat chuong trinh.")
+print("da thoat chuong trinh.")
