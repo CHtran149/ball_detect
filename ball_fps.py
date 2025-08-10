@@ -1,110 +1,124 @@
-import torch
 import cv2
-import time
+import torch
 import math
-import warnings
-warnings.filterwarnings("ignore")
+import sys
+import numpy as np
 
-# ==== CẤU HÌNH ====
-MODEL_PATH = r"E:/ball/ball/yolov5/runs/train/roboflow_yolov52/weights/best.pt"  # Đường dẫn model của bạn, có thể load model riêng nếu muốn
+# Thêm đường dẫn repo yolov5 để import
+sys.path.insert(0, '/home/jetson/yolov5')
+
+from models.common import DetectMultiBackend
+from utils.general import non_max_suppression, scale_coords
+from utils.plots import Annotator, colors
+
+# Cấu hình
+MODEL_PATH = "./models/best.pt"
 IMG_SIZE = 640
 CONF_THRESHOLD = 0.25
 
-# ==== Load model YOLOv5 ====
-# Nếu muốn dùng model riêng, thay 'yolov5s' bằng đường dẫn MODEL_PATH, ví dụ:
-# model = torch.hub.load('ultralytics/yolov5', 'custom', path=MODEL_PATH)
-model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
-model.conf = CONF_THRESHOLD
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model.to(device)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
 
-# ==== Mở webcam ====
-cap = cv2.VideoCapture(0)  # 0 là camera mặc định
+# Load model
+model = DetectMultiBackend(MODEL_PATH, device=device)
+model.model.eval()
+
+# Mở webcam
+cap = cv2.VideoCapture(0)
+if not cap.isOpened():
+    print("Cannot open webcam")
+    exit()
+
 width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+fps_video = cap.get(cv2.CAP_PROP_FPS) if cap.get(cv2.CAP_PROP_FPS) > 0 else 30
 
-# Điểm A: chính giữa đáy khung hình
-point_A = (width // 2, height)
+point_A = (width // 2, height)  # điểm A: chính giữa đáy khung hình
 
-print("🚀 Đang xử lý webcam... Nhấn 'q' để thoát")
-
-prev_time = time.time()
+print("Nhan q de thoat")
 
 while True:
     ret, frame = cap.read()
     if not ret:
-        print("Không thể lấy frame từ webcam")
+        print("Khong the lay frame tu webcam")
         break
 
-    start_time = time.time()
+    start_time = torch.cuda.Event(enable_timing=True)
+    end_time = torch.cuda.Event(enable_timing=True)
 
-    # Inference YOLOv5
-    results = model(frame, size=IMG_SIZE)
-    detections = results.xyxy[0].cpu().numpy()  # (x1, y1, x2, y2, conf, class)
-    class_names = results.names
+    start_time.record()
+
+    # Chuẩn bị ảnh đầu vào cho model
+    img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    img_resized = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
+
+    img_tensor = torch.from_numpy(img_resized).to(device)
+    img_tensor = img_tensor.permute(2, 0, 1).float()  # HWC to CHW
+    img_tensor /= 255.0  # Normalize 0-1
+    img_tensor = img_tensor.unsqueeze(0)  # Thêm batch dimension
+
+    # Inference
+    pred = model(img_tensor)[0]
+
+    # NMS
+    pred = non_max_suppression(pred, CONF_THRESHOLD, 0.45)
 
     ball_count = 0
-    angles_list = []
 
-    for i, det in enumerate(detections):
-        if ball_count >= 3:  # chỉ xử lý tối đa 3 quả bóng
-            break
+    annotator = Annotator(frame)
 
-        x1, y1, x2, y2, conf, cls_id = det
-        class_name = class_names[int(cls_id)]
+    if pred[0] is not None:
+        # Scale bbox về kích thước ảnh gốc
+        pred_scaled = scale_coords(img_tensor.shape[2:], pred[0][:, :4], frame.shape).round()
+        confs = pred[0][:, 4]
+        class_ids = pred[0][:, 5].int()
 
-        # Nếu bạn muốn lọc chỉ những class "ball" hoặc "sports ball" thì có thể check class_name ở đây
+        for i, (*xyxy, conf, cls) in enumerate(pred[0]):
+            # Lấy bbox scaled đúng
+            x1, y1, x2, y2 = pred_scaled[i]
 
-        ball_count += 1
-        label = f"Ball {ball_count}"
+            ball_count += 1
+            label = f"Ball {ball_count}"
 
-        # Vẽ khung
-        cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+            # Vẽ bbox
+            annotator.box_label(xyxy, label, color=colors(int(cls), True))
 
-        # Tâm quả bóng
-        center_x = int((x1 + x2) / 2)
-        center_y = int((y1 + y2) / 2)
-        ball_center = (center_x, center_y)
+            # Tâm quả bóng
+            center_x = int((x1 + x2) / 2)
+            center_y = int((y1 + y2) / 2)
+            ball_center = (center_x, center_y)
 
-        # Tính góc giữa trục dọc và đường nối từ điểm A tới quả bóng
-        dx = center_x - point_A[0]
-        dy = point_A[1] - center_y  # y ngược trong OpenCV
+            # Tính góc giữa trục dọc và đường nối từ điểm A tới quả bóng
+            dx = center_x - point_A[0]
+            dy = point_A[1] - center_y  # trục y ngược trong OpenCV
 
-        angle_rad = math.atan2(dx, dy)  # dx trước vì trục gốc là dọc
-        angle_deg = math.degrees(angle_rad)
+            angle_rad = math.atan2(dx, dy)
+            angle_deg = math.degrees(angle_rad)
 
-        angles_list.append(angle_deg)
+            # Vẽ đường nối từ A đến tâm bóng
+            cv2.line(frame, point_A, ball_center, (0, 0, 255), 2)
 
-        # Vẽ đường nối từ A đến tâm bóng
-        cv2.line(frame, point_A, ball_center, (0, 0, 255), 2)
+            # Ghi nhãn góc lên frame
+            cv2.putText(frame, f"{label} ({angle_deg:.1f} deg)", (int(x1), int(y1) - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-        # Ghi nhãn bóng và góc
-        cv2.putText(frame, f"{label} ({angle_deg:.1f} deg)", (int(x1), int(y1) - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            # In góc ra terminal
+            print(f"{label}: angle = {angle_deg:.1f} degrees")
 
-    # Hiển thị tổng số bóng góc trên phải
-    cv2.putText(frame, f"Balls: {ball_count}", (width - 150, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 100, 0), 2)
+    annotator.text((width - 150, 30), f"Balls: {ball_count}", color=(255, 100, 0), txt_color=(255, 255, 255))
+    annotator.apply(frame)
 
     # Tính FPS
-    end_time = time.time()
-    fps = 1 / (end_time - start_time + 1e-6)
+    end_time.record()
+    torch.cuda.synchronize()
+    fps = 1000 / start_time.elapsed_time(end_time)
     cv2.putText(frame, f"FPS: {fps:.2f}", (10, height - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-    # In góc lệch và fps ra terminal
-    if angles_list:
-        angles_str = ", ".join([f"{a:.1f}°" for a in angles_list])
-        print(f"Góc lệch 3 quả bóng (nếu có): {angles_str} | FPS: {fps:.2f}")
-    else:
-        print(f"Không phát hiện bóng | FPS: {fps:.2f}")
-
-    # Hiển thị frame
     cv2.imshow("Ball Detection with Angle", frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
-# Cleanup
 cap.release()
 cv2.destroyAllWindows()
-print("✅ Đã thoát chương trình")
+print("Da thoat chuong trinh.")
